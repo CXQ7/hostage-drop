@@ -1,0 +1,22 @@
+server:
+  port: 8080
+
+spring:
+  activemq:
+    broker-url: tcp://localhost:61616
+    user: admin
+    password: admin
+  jms:
+    pub-sub-domain: false
+
+app:
+  jms:
+    escrow-queue: QUEUE_ESCROW
+    user-queue-prefix: QUEUE_USER_
+    user-queue-wildcard: QUEUE_USER_>
+    dlq: ActiveMQ.DLQ
+    default-ttl-seconds: 180
+    bait-notification-ttl-seconds: 86400
+  history:
+    base-dir: data/history
+    recent-limit: 120
