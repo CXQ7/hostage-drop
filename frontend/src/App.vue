@@ -14,7 +14,7 @@ const seenEventKeys = new Set();
 const messageStream = ref(null);
 const pendingInitiate = ref(null);
 const pendingPay = ref(null);
-const maxUploadBytes = 10 * 1024 * 1024;
+const maxUploadBytes = 50 * 1024 * 1024; // 提升到 50MB 以支持音视频
 const historyLoaded = ref(false);
 
 const activeBait = reactive({
@@ -71,6 +71,14 @@ function isImage(dataUrl) {
   return typeof dataUrl === "string" && dataUrl.startsWith("data:image");
 }
 
+function isAudio(dataUrl) {
+  return typeof dataUrl === "string" && dataUrl.startsWith("data:audio");
+}
+
+function isVideo(dataUrl) {
+  return typeof dataUrl === "string" && dataUrl.startsWith("data:video");
+}
+
 function nowLabel() {
   return new Date().toLocaleTimeString();
 }
@@ -87,19 +95,35 @@ function extractLastBaitContext(items) {
 }
 
 function loadHistory(items) {
-  chatMessages.value = (items || []).map((entry) => ({
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    time: entry.time || nowLabel(),
-    side: entry.side || "center",
-    type: entry.type || "system",
-    title: entry.title || "历史消息",
-    fileName: entry.fileName || "",
-    text: entry.text || "",
-    imageUrl: entry.imageUrl || "",
-    txId: entry.txId || "",
-    senderId: entry.senderId || "",
-    txStatus: entry.txStatus || "",
-  }));
+  chatMessages.value = (items || []).map((entry) => {
+    const msg = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      time: entry.time || nowLabel(),
+      side: entry.side || "center",
+      type: entry.type || "system",
+      title: entry.title || "历史消息",
+      fileName: entry.fileName || "",
+      text: entry.text || "",
+      imageUrl: entry.imageUrl || "",
+      txId: entry.txId || "",
+      senderId: entry.senderId || "",
+      txStatus: entry.txStatus || "",
+      expireAt: entry.expireAt || 0,
+      countdownLabel: "进行中",
+    };
+
+    // 如果历史消息自带过期时间，立即触发一次状态更新逻辑
+    if (msg.type === "bait" && msg.expireAt) {
+      const leftSec = Math.floor((msg.expireAt - Date.now()) / 1000);
+      if (leftSec <= 0) {
+        msg.countdownLabel = "已过期";
+      } else {
+        msg.countdownLabel = `剩余 ${leftSec}s`;
+        // 为每一条还在进行的盲盒启动独立计时（或者稍后在 handleBubbleClick 中恢复）
+      }
+    }
+    return msg;
+  });
 
   const baitContext = extractLastBaitContext(items);
   if (baitContext) {
@@ -143,6 +167,30 @@ function clearBlindBox() {
   }
 }
 
+function handleBubbleClick(item) {
+  if (item.type === "bait") {
+    // 检查是否已经过期
+    const isActuallyExpired = item.expireAt && item.expireAt < Date.now();
+
+    if (item.countdownLabel === "已过期" || isActuallyExpired) {
+      item.countdownLabel = "已过期"; // 确保状态更新
+      ElMessage.warning("该盲盒已过期");
+      return;
+    }
+
+    blindBox.visible = true;
+    blindBox.txId = item.txId || "";
+    blindBox.senderId = item.senderId || "";
+    blindBox.fileName = item.fileName || "";
+
+    // 恢复该盲盒的倒计时状态到全局弹窗
+    if (item.expireAt) {
+      startBlindBoxCountdown(item.expireAt);
+    }
+    ElMessage.info(`查看盲盒: ${item.txId}`);
+  }
+}
+
 function dismissBlindBox() {
   blindBox.visible = false;
   if (blindBoxTimer.value) {
@@ -160,16 +208,33 @@ function startBlindBoxCountdown(expireAt) {
   const tick = () => {
     const leftSec = Math.floor((blindBox.expireAt - Date.now()) / 1000);
     if (leftSec <= 0) {
-      pushBubble({
-        side: "center",
-        type: "system",
-        title: "盲盒已超时",
-        text: "Watchdog 到达绝对过期时间，弹窗已自动销毁。",
+      blindBox.countdownLabel = "已过期";
+      // 更新聊天记录中的对应气泡状态
+      chatMessages.value.forEach((msg) => {
+        if (msg.type === "bait" && msg.expireAt === expireAt) {
+          msg.countdownLabel = "已过期";
+        }
       });
-      clearBlindBox();
+
+      if (blindBox.visible) {
+        pushBubble({
+          side: "center",
+          type: "system",
+          title: "盲盒已超时",
+          text: "Watchdog 到达绝对过期时间，弹窗已自动销毁。",
+        });
+        clearBlindBox();
+      }
       return;
     }
-    blindBox.countdownLabel = `剩余 ${leftSec}s · 绝对过期 ${new Date(blindBox.expireAt).toLocaleTimeString()}`;
+    const label = `剩余 ${leftSec}s · 绝对过期 ${new Date(blindBox.expireAt).toLocaleTimeString()}`;
+    blindBox.countdownLabel = label;
+    // 同步更新气泡中的倒计时
+    chatMessages.value.forEach((msg) => {
+      if (msg.type === "bait" && msg.expireAt === expireAt) {
+        msg.countdownLabel = label;
+      }
+    });
   };
 
   tick();
@@ -508,6 +573,7 @@ function handleGatewayEvent(message) {
     blindBox.txId = message.txId || "";
     blindBox.senderId = message.senderId || "";
     blindBox.fileName = "";
+    blindBox.expireAt = message.expireAt;
     startBlindBoxCountdown(message.expireAt);
     pushBubble({
       side: "left",
@@ -515,6 +581,8 @@ function handleGatewayEvent(message) {
       title: `${message.senderId || "对方"} 发来一个上锁盲盒`,
       senderId: message.senderId || "",
       txId: message.txId || "",
+      expireAt: message.expireAt,
+      countdownLabel: "进行中",
       text: [`交易号 ${message.txId}`, message.textContent]
         .filter(Boolean)
         .join("\n"),
@@ -596,9 +664,6 @@ onBeforeUnmount(() => {
               v-model="session.peerId"
               placeholder="对话对象ID，例如 A"
             />
-            <el-button type="info" class="full-btn" plain @click="switchPeer"
-              >切换对话对象</el-button
-            >
             <el-button type="warning" class="full-btn" @click="connectGateway"
               >开始实时会话</el-button
             >
@@ -610,18 +675,14 @@ onBeforeUnmount(() => {
 
         <el-card class="panel-card persona-card" shadow="never">
           <template #header>
-            <div class="panel-title">当前会话</div>
+            <div class="panel-title">会话状态</div>
           </template>
-          <div class="persona-pill">
-            <span>你</span>
-            <strong>{{ session.userId || "未命名" }}</strong>
-          </div>
-          <div class="persona-pill muted">
-            <span>对话对象</span>
-            <strong>{{ peerLabel }}</strong>
+          <div class="chat-status-text">
+            您 (<strong>{{ session.userId || "未命名" }}</strong
+            >) 正在与 <strong>{{ session.peerId || "未指定对象" }}</strong> 对话
           </div>
           <p class="panel-tip">
-            所有发起与支付动作都会实时送达，离线消息会自动补投。
+            消息实时送达，离线状态下的消息将在网络恢复连接后自动发送。
           </p>
         </el-card>
       </aside>
@@ -638,7 +699,7 @@ onBeforeUnmount(() => {
         <main class="message-stream" ref="messageStream">
           <div v-if="!chatMessages.length" class="empty-state">
             <div class="empty-icon">💬</div>
-            <p>先开始会话，再上传真实图片文件发起一次盲盒交易。</p>
+            <p>让信息传递像打开盲盒一样有趣！</p>
           </div>
 
           <div
@@ -654,12 +715,19 @@ onBeforeUnmount(() => {
             <div
               class="bubble"
               :class="[`bubble-${item.side}`, `bubble-${item.type}`]"
+              @click="handleBubbleClick(item)"
             >
               <div class="bubble-title">{{ item.title }}</div>
               <div v-if="item.fileName" class="bubble-file">
                 {{ item.fileName }}
               </div>
               <div v-if="item.text" class="bubble-text">{{ item.text }}</div>
+              <div
+                v-if="item.type === 'bait' && item.countdownLabel"
+                class="bubble-countdown"
+              >
+                ⏳ {{ item.countdownLabel }}
+              </div>
               <div v-if="item.txStatus" class="bubble-status">
                 状态：{{ item.txStatus }}
               </div>
@@ -669,6 +737,18 @@ onBeforeUnmount(() => {
                 class="bubble-image"
                 alt="preview"
               />
+              <audio
+                v-if="isAudio(item.imageUrl)"
+                :src="item.imageUrl"
+                controls
+                class="bubble-media"
+              ></audio>
+              <video
+                v-if="isVideo(item.imageUrl)"
+                :src="item.imageUrl"
+                controls
+                class="bubble-media"
+              ></video>
               <div class="bubble-time">{{ item.time }}</div>
             </div>
           </div>
@@ -678,10 +758,6 @@ onBeforeUnmount(() => {
           <el-tabs v-model="activeComposer" stretch>
             <el-tab-pane label="发起盲盒" name="initiate">
               <div class="composer-grid">
-                <el-input
-                  v-model="session.peerId"
-                  placeholder="接收方ID，例如 user-c"
-                />
                 <el-input
                   v-model="initiateForm.textContent"
                   type="textarea"
@@ -693,20 +769,23 @@ onBeforeUnmount(() => {
                   :min="10"
                   :step="10"
                   class="wide-number"
-                />
+                >
+                  <template #suffix>秒 (TTL)</template>
+                </el-input-number>
                 <el-upload
                   class="uploader"
                   :auto-upload="false"
                   :show-file-list="true"
                   :limit="1"
-                  accept="image/*"
+                  accept=".jpg,.jpeg,.png,.pdf,.doc,.docx,.mp3,.wav,.mp4,.webm"
                   :file-list="initiateFileList"
                   :on-change="onInitiateFileChange"
                   :on-remove="removeInitiateFile"
                 >
-                  <el-button type="primary" plain
-                    >选择真实图片文件（选填）</el-button
-                  >
+                  <div style="display: flex; align-items: center; gap: 12px">
+                    <el-button type="warning" plain>选择文件</el-button>
+                    <span class="file-type-tip">支持 Doc/Img/Video/Audio</span>
+                  </div>
                 </el-upload>
               </div>
               <div
@@ -718,12 +797,39 @@ onBeforeUnmount(() => {
                   alt="initiate-preview"
                 />
               </div>
+              <div
+                v-else-if="isAudio(initiateForm.filePreviewUrl)"
+                class="preview-box"
+              >
+                <audio
+                  :src="initiateForm.filePreviewUrl"
+                  controls
+                  class="full-width-media"
+                ></audio>
+              </div>
+              <div
+                v-else-if="isVideo(initiateForm.filePreviewUrl)"
+                class="preview-box"
+              >
+                <video
+                  :src="initiateForm.filePreviewUrl"
+                  controls
+                  class="full-width-media"
+                ></video>
+              </div>
+              <div
+                v-else-if="initiateForm.fileName"
+                class="preview-box file-placeholder"
+              >
+                <div class="file-icon">📄</div>
+                <div class="file-name">{{ initiateForm.fileName }}</div>
+              </div>
               <el-button type="warning" class="send-btn" @click="initiateTrade"
                 >发起担保交易</el-button
               >
             </el-tab-pane>
 
-            <el-tab-pane label="支付赎金" name="pay">
+            <el-tab-pane label="开启凭证" name="pay">
               <div class="composer-grid">
                 <el-input
                   v-model="payForm.txId"
@@ -745,12 +851,15 @@ onBeforeUnmount(() => {
                   :auto-upload="false"
                   :show-file-list="true"
                   :limit="1"
-                  accept="image/*"
+                  accept=".jpg,.jpeg,.png,.pdf,.doc,.docx,.mp3,.wav,.mp4,.webm"
                   :file-list="payFileList"
                   :on-change="onPayFileChange"
                   :on-remove="removePayFile"
                 >
-                  <el-button type="danger" plain>选择赎金图片文件</el-button>
+                  <div style="display: flex; align-items: center; gap: 12px">
+                    <el-button type="danger" plain>选择文件</el-button>
+                    <span class="file-type-tip">支持 Doc/Img/Video/Audio</span>
+                  </div>
                 </el-upload>
               </div>
               <div
@@ -759,8 +868,35 @@ onBeforeUnmount(() => {
               >
                 <img :src="payForm.ransomPreviewUrl" alt="pay-preview" />
               </div>
+              <div
+                v-else-if="isAudio(payForm.ransomPreviewUrl)"
+                class="preview-box preview-ransom"
+              >
+                <audio
+                  :src="payForm.ransomPreviewUrl"
+                  controls
+                  class="full-width-media"
+                ></audio>
+              </div>
+              <div
+                v-else-if="isVideo(payForm.ransomPreviewUrl)"
+                class="preview-box preview-ransom"
+              >
+                <video
+                  :src="payForm.ransomPreviewUrl"
+                  controls
+                  class="full-width-media"
+                ></video>
+              </div>
+              <div
+                v-else-if="payForm.ransomFileName"
+                class="preview-box preview-ransom file-placeholder"
+              >
+                <div class="file-icon">📄</div>
+                <div class="file-name">{{ payForm.ransomFileName }}</div>
+              </div>
               <el-button type="danger" class="send-btn" @click="payRansom"
-                >支付赎金并请求释放</el-button
+                >开启凭证并请求释放</el-button
               >
             </el-tab-pane>
           </el-tabs>
